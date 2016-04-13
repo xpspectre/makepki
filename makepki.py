@@ -7,7 +7,6 @@ import yaml
 import socket
 import copy
 import os
-import shutil
 from subprocess import call
 
 if len(sys.argv) < 2:
@@ -63,7 +62,7 @@ if 'localdomain' in common_options and common_options['localdomain'] is True:
     common['domain'] = this_domain
 
 DOMAIN = common['domain']
-DOMAIN1 = DOMAIN.split('.',1)[0]  # left-most subdomain is used for serial number file
+# DOMAIN1 = DOMAIN.split('.',1)[0]  # left-most subdomain is used for serial number file
 
 # Default options
 if 'keysize' in common_options:
@@ -110,7 +109,7 @@ if os.path.isfile(serialFile):
 
 # Make host certificates
 print('Making host certificates...')
-ind = 1
+ind = 1  # Index for serial number generation
 for host in hosts:
 
     if isinstance(host, str):  # Use all default fields + hostname
@@ -146,23 +145,21 @@ for host in hosts:
         os.path.join(DOMAIN, '%s.csr' % (hostname,)),
         subject))
 
+    # The 1st CSR signed is used to generate a random serial
     print("Making %s's certificate..." % (hostname,))
     if ind == 1:
         serialString = '-CAcreateserial'
     else:
-        serialString = '-CAserial %s' % (serialFile,)
+        serialString = ''
 
-    runcmd('openssl x509 -req -in %s -CA %s -CAkey %s %s -out %s -days %d' % (
+    runcmd('openssl x509 -req -in %s -CA %s -CAkey %s %s -CAserial %s -out %s -days %d' % (
         os.path.join(DOMAIN, '%s.csr' % (hostname,)),
         os.path.join(DOMAIN, 'ca.pem'),
         os.path.join(DOMAIN, 'ca.key'),
         serialString,
+        serialFile,
         os.path.join(DOMAIN, '%s.pem' % (hostname,)),
         LIFETIME))
-
-    # Move serial file to right place (since openssl always places it in the current directory
-    if ind == 1:
-        shutil.move('%s.srl' % (DOMAIN1,), serialFile)
 
     f_srl = open(serialFile)
     srl = f_srl.read()
