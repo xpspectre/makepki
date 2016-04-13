@@ -25,7 +25,7 @@ def expand(s):
             endLen = len(end)
             for i in range(startVal, endVal + 1):
                 if startLen == endLen:  # pad with zeros (no additional effect unless vals, esp the start val, have explicit extra padding)
-                    expansion.append(str(i).zfill(len(start)))
+                    expansion.append(str(i).zfill(startLen))
                 else:  # don't pad
                     expansion.append(str(i))
 
@@ -38,7 +38,7 @@ def expand(s):
         expansions.append(expansion)
 
     # Assemble combinations
-    combos = list(itertools.product(*expansions))
+    combos = itertools.product(*expansions)
     expandeds = []
     for entries in combos:
         expanded = s
