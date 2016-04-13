@@ -8,6 +8,7 @@ import socket
 import copy
 import os
 from subprocess import call
+import pkitools
 
 if len(sys.argv) < 2:
     raise Exception('No input file specified')
@@ -107,12 +108,23 @@ serialFile = os.path.join(DOMAIN, 'ca.srl')
 if os.path.isfile(serialFile):
     os.remove(serialFile)
 
+# Expand hosts with template strings and add to hosts
+expandedHosts = []
+for i in range(len(hosts)):
+    host = hosts[i]
+    if isinstance(host, str) and "[" in host:  # expanded hosts can't override anything
+        hosts.extend(pkitools.expand(host))  # online extension is OK since we only iterate thru original entries
+        hosts[i] = None
+
 # Make host certificates
 print('Making host certificates...')
 ind = 1  # Index for serial number generation
 for host in hosts:
 
-    if isinstance(host, str):  # Use all default fields + hostname
+    if host is None:  # skip holes from template interpolation
+        continue
+
+    elif isinstance(host, str):  # Use all default fields + hostname
         fields = merge_dict(common, {'hostname': host})
 
     elif isinstance(host, dict):  # Overwrite some fields
