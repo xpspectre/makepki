@@ -7,6 +7,8 @@ import yaml
 import socket
 import copy
 import os
+import random
+import string
 from subprocess import call
 import pkitools
 
@@ -14,7 +16,7 @@ if len(sys.argv) < 2:
     raise Exception('No input file specified')
 
 # Necessary boilerplate
-print("Warning: this script is for testing purposes only (for now). Private keys aren't encrypted.")
+print("Warning: This script is for testing purposes only (for now). Private keys aren't encrypted.")
 
 # Useful host and domain information
 this_host = socket.gethostname()
@@ -26,17 +28,22 @@ with open(filename, 'r') as f:
     doc = yaml.load(f)
 
 
-# Helper function for merging dict fields over another dict
 def merge_dict(bot, top):
-    """Merge top dict onto bot dict, so that the returned new dict has the updated top vals"""
+    """Helper function for merging dict fields over another dict.
+    Merge top dict onto bot dict, so that the returned new dict has the updated top vals."""
     new = copy.deepcopy(bot)
     for k,v in top.items():
         new[k] = v
     return new
 
 
-# Helper function for building the subject line for an X.509 CSR
+def random_string(N):
+    """Make random string of letters and digits for temporary extension config file names"""
+    return ''.join(random.SystemRandom().choice(string.ascii_letters + string.digits) for _ in range(N))
+
+
 def make_subject(fields):
+    """Helper function for building the subject line for an X.509 CSR"""
     # Populate required fields
     subject = "/C=%(C)s/ST=%(ST)s/L=%(L)s/O=%(O)s/CN=%(hostname)s.%(domain)s" % fields
 
@@ -46,8 +53,32 @@ def make_subject(fields):
 
     return subject
 
-# Helper function for debugging and running shell commands
+
+def make_extensions(fields):
+    """Helper function for building an extension config file. The 'extension' field in fields can be either a string
+    or a list (iterable) of strings."""
+    if 'extension' in fields:
+        config_file = os.path.join(DOMAIN, random_string(5) + '.conf')
+        with open(config_file, 'w') as f:
+            # f.write('[extensions]\n')
+            vals = fields['extension']
+            if isinstance(vals, list):
+                for val in vals:
+                    if not isinstance(val, str):
+                        raise ValueError('Extension in list of extensions must be a string')
+                    f.write("%s\n" % val)
+            elif isinstance(vals, str):
+                f.write("%s\n" % vals)
+            else:
+                raise ValueError('Extension must be a string or list of strings')
+    else:
+        config_file = None
+
+    return config_file
+
+
 def runcmd(cmd):
+    """Helper function for debugging and running shell commands"""
     print('> ' + cmd)
     call(cmd, shell=True)
 
@@ -63,7 +94,6 @@ if 'localdomain' in common_options and common_options['localdomain'] is True:
     common['domain'] = this_domain
 
 DOMAIN = common['domain']
-# DOMAIN1 = DOMAIN.split('.',1)[0]  # left-most subdomain is used for serial number file
 
 # Default options
 if 'keysize' in common_options:
@@ -78,7 +108,7 @@ else:
 
 # Process hosts
 if 'hosts' not in doc:
-    raise Exception('hosts list not in doc')
+    raise ValueError('hosts list not in doc')
 hosts = doc['hosts']
 
 # Make directory to hold results
@@ -104,9 +134,9 @@ runcmd('openssl req -x509 -new -nodes -key %s -days %d -out %s -sha256 -subj "%s
 
 # Delete existing serial to start clean
 print('Deleting old serial (if it exists)...')
-serialFile = os.path.join(DOMAIN, 'ca.srl')
-if os.path.isfile(serialFile):
-    os.remove(serialFile)
+serial_file = os.path.join(DOMAIN, 'ca.srl')
+if os.path.isfile(serial_file):
+    os.remove(serial_file)
 
 # Expand hosts with template strings and add to hosts
 expandedHosts = []
@@ -138,45 +168,56 @@ for host in hosts:
             extra_fields['hostname'] = this_host
         if 'localdomain' in options and options['localdomain'] is True:
             extra_fields['domain'] = this_domain
+        if 'extension' in options:  # Arbitrary extra extensions
+            extra_fields['extension'] = options['extension']
 
         fields = merge_dict(common, extra_fields)
 
     else:
-        raise Exception('host is not a str or dict')
+        raise ValueError('host is not a str or dict')
 
     hostname = fields['hostname']
     subject = make_subject(fields)
+    extension_config_file = make_extensions(fields)
 
     print("Making %s's private key..." % (hostname,))
     runcmd("openssl genrsa -out %s %d" % (os.path.join(DOMAIN, '%s.key' % (hostname,)), KEYSIZE))
 
     print("Making %s's CSR..." % (hostname,))
-
     runcmd('openssl req -new -key %s -out %s -sha256 -subj "%s"' % (
         os.path.join(DOMAIN, '%s.key' % (hostname,)),
         os.path.join(DOMAIN, '%s.csr' % (hostname,)),
         subject))
 
     # The 1st CSR signed is used to generate a random serial
-    print("Making %s's certificate..." % (hostname,))
+    print("Signing %s's certificate..." % (hostname,))
     if ind == 1:
-        serialString = '-CAcreateserial'
+        serial_string = '-CAcreateserial'
     else:
-        serialString = ''
+        serial_string = ''
 
-    runcmd('openssl x509 -req -in %s -CA %s -CAkey %s %s -CAserial %s -out %s -days %d' % (
+    if extension_config_file is not None:
+        extension_string = '-extfile %s' % extension_config_file
+    else:
+        extension_string = ''
+
+    runcmd('openssl x509 -req -in %s -CA %s -CAkey %s %s -CAserial %s %s -out %s -days %d' % (
         os.path.join(DOMAIN, '%s.csr' % (hostname,)),
         os.path.join(DOMAIN, 'ca.pem'),
         os.path.join(DOMAIN, 'ca.key'),
-        serialString,
-        serialFile,
+        serial_string,
+        serial_file,
+        extension_string,
         os.path.join(DOMAIN, '%s.pem' % (hostname,)),
         LIFETIME))
 
-    f_srl = open(serialFile)
+    if extension_config_file is not None:  # Cleanup. If the above command fails, you can look at the config file.
+        os.remove(extension_config_file)
+
+    f_srl = open(serial_file)
     srl = f_srl.read()
     f_srl.close()
-    print("%s's certificate has serial number %s..." % (hostname,srl))
+    print("%s's certificate has serial number %s..." % (hostname, srl))
 
     # Increment index for serial number generation
     ind += 1
