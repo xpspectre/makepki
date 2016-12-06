@@ -214,6 +214,21 @@ for host in hosts:
     if extension_config_file is not None:  # Cleanup. If the above command fails, you can look at the config file.
         os.remove(extension_config_file)
 
+    # Combine certs into pkcs12 format if desired
+    # Also remove separate cert and key
+    # TODO: add other options here as desired - for example, don't include the CA cert in there
+    if 'combine_pkcs12' in common_options:
+        COMBINE_MODE = common_options['combine_pkcs12']
+        if COMBINE_MODE == 'all':
+            runcmd('openssl pkcs12 -export -in %s -inkey %s -certfile %s -out %s -passout pass:' % (
+                os.path.join(DOMAIN, '%s.pem' % (hostname,)),
+                os.path.join(DOMAIN, '%s.key' % (hostname,)),
+                os.path.join(DOMAIN, 'ca.pem'),
+                os.path.join(DOMAIN, '%s.p12' % (hostname,)),
+            ))
+            os.remove(os.path.join(DOMAIN, '%s.pem' % (hostname,)))
+            os.remove(os.path.join(DOMAIN, '%s.key' % (hostname,)))
+
     f_srl = open(serial_file)
     srl = f_srl.read()
     f_srl.close()
