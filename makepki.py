@@ -1,38 +1,152 @@
 #!/usr/bin/env python3
 # Make PKI from config file
 # Sample config file at example.conf in the directory
-
 import sys
 import yaml
+import logging
 import socket
 import copy
 import os
 import random
 import string
-from subprocess import call
+from OpenSSL import crypto
+import uuid
 import pkitools
 
-if len(sys.argv) < 2:
-    raise Exception('No input file specified')
 
-# Necessary boilerplate
-print("Warning: This script is for testing purposes only (for now). Private keys aren't encrypted.")
+_ONE_DAY_IN_SEC = 60 * 60 * 24
+_SUBJECT_FIELDS = ['C', 'ST', 'L', 'O', 'OU', 'CN', 'emailAddress']
 
-# Useful host and domain information
-this_host = socket.gethostname()
-this_fqdn = socket.getfqdn()
-this_domain = this_fqdn[::-1].rsplit('.',1)[0][::-1]
 
-filename = sys.argv[1]
-with open(filename, 'r') as f:
-    doc = yaml.load(f)
+def gen_key(size=2048):
+    """Make an RSA private key
+
+    Args:
+        size: int, size of key in bytes. Min size = 2048.
+
+    Returns:
+        PKey obj, private key
+    """
+    if size < 2048:
+        raise ValueError('Key must be >= 2048 bytes')
+
+    key = crypto.PKey()
+    key.generate_key(crypto.TYPE_RSA, size)
+    return key
+
+
+def write_private_key(key, filename, passphrase=None):
+    """Write key to file using usual PEM encoding, optionally encrypted with passphrase
+
+    Args:
+        key: PKey obj, private key
+        filename: str location to save file
+        passphrase: str passphrase to encrypt key
+    """
+    with open(filename, 'wb') as f:
+        f.write(crypto.dump_privatekey(crypto.FILETYPE_PEM, key, passphrase=passphrase))
+
+
+def write_certificate(crt, filename):
+    """Write certificate to file using usual PEM encoding.
+
+    Args:
+        X509 obj, certificate
+        filename: str location to save file
+    """
+    with open(filename, 'wb') as f:
+        f.write(crypto.dump_certificate(crypto.FILETYPE_PEM, crt))
+
+
+def gen_ca(ca_key, **fields):
+    """Create CA authority/cert.
+
+    Args:
+        ca_key: PKey obj, CA private key
+        fields: named args dict of fields
+
+
+    Returns:
+        X509 obj, CA certificate
+    """
+    crt = crypto.X509()
+    crt.set_version(2)  # version 3, counts from 0
+    crt.set_serial_number(1)
+
+    sub = crt.get_subject()
+    for sub_field in _SUBJECT_FIELDS:
+        if sub_field in fields:
+            setattr(sub, sub_field, fields[sub_field])
+    crt.set_issuer(sub)
+
+    crt.add_extensions([
+        crypto.X509Extension(b'basicConstraints', True, b'CA:TRUE, pathlen:0'),
+        crypto.X509Extension(b'keyUsage', True, b'keyCertSign, cRLSign'),
+        crypto.X509Extension(b'subjectKeyIdentifier', False, b'hash', subject=crt),
+    ])
+
+    crt.gmtime_adj_notBefore(0)
+    crt.gmtime_adj_notAfter(fields['lifetime'] * _ONE_DAY_IN_SEC)
+
+    crt.set_pubkey(ca_key)
+    crt.sign(ca_key, 'sha256')
+    return crt
+
+
+def sign_key(key, ca_key, ca_crt, **fields):
+    """Create a certificate signing request for a client with key, and sign with CA key and info.
+
+    Args:
+        key: PKey obj, client private key
+        ca_key: PKey obj, CA private key
+        ca_crt: X509 obj, CA certificate
+
+    Returns:
+        X509 obj, signed client certificate
+    """
+
+    # Make CSR
+    req = crypto.X509Req()
+
+    sub = req.get_subject()
+    for sub_field in _SUBJECT_FIELDS:
+        if sub_field in fields:
+            setattr(sub, sub_field, fields[sub_field])
+
+    req.set_pubkey(key)
+    req.sign(key, 'sha256')
+
+    # Sign CSR and make crt
+    crt = crypto.X509()
+    crt.set_version(2)
+    crt.set_serial_number(int(uuid.uuid4()))  # all certs now get a random serial number
+
+    crt.set_subject(req.get_subject())
+    crt.set_issuer(ca_crt.get_subject())
+
+    # Default extensions for all non-CA certs
+    extensions = [
+        crypto.X509Extension(b'basicConstraints', True, b'CA:FALSE'),
+        crypto.X509Extension(b'keyUsage', True, b'nonRepudiation, digitalSignature, keyEncipherment'),
+        crypto.X509Extension(b'subjectKeyIdentifier', False, b'hash', subject=crt),
+        crypto.X509Extension(b'authorityKeyIdentifier', False, b'keyid', issuer=ca_crt),
+    ]
+    crt.add_extensions(extensions)
+
+    crt.gmtime_adj_notBefore(0)
+    crt.gmtime_adj_notAfter(fields['lifetime'] * _ONE_DAY_IN_SEC)
+
+    crt.set_pubkey(key)
+    crt.sign(ca_key, 'sha256')
+
+    return crt
 
 
 def merge_dict(bot, top):
     """Helper function for merging dict fields over another dict.
     Merge top dict onto bot dict, so that the returned new dict has the updated top vals."""
     new = copy.deepcopy(bot)
-    for k,v in top.items():
+    for k, v in top.items():
         new[k] = v
     return new
 
@@ -42,199 +156,122 @@ def random_string(N):
     return ''.join(random.SystemRandom().choice(string.ascii_letters + string.digits) for _ in range(N))
 
 
-def make_subject(fields):
-    """Helper function for building the subject line for an X.509 CSR"""
-    # Populate required fields
-    subject = "/C=%(C)s/ST=%(ST)s/L=%(L)s/O=%(O)s/CN=%(hostname)s.%(domain)s" % fields
+def main():
+    # Load config file cmd arg
+    if len(sys.argv) < 2:
+        raise Exception('No input file specified')
 
-    # Populate optional fields
-    if 'emailAddress' in fields:
-        subject += "/emailAddress=%(emailAddress)s" % fields
+    # Set logging
+    logging.basicConfig(level=logging.INFO)
 
-    return subject
+    # Necessary boilerplate
+    logging.warning("Warning: This script is for testing purposes only (for now). Private keys aren't encrypted.")
 
+    # Useful host and domain information
+    this_host = socket.gethostname()
+    this_fqdn = socket.getfqdn()
+    this_domain = this_fqdn[::-1].rsplit('.',1)[0][::-1]
 
-def make_extensions(fields):
-    """Helper function for building an extension config file. The 'extension' field in fields can be either a string
-    or a list (iterable) of strings."""
-    if 'extension' in fields:
-        config_file = os.path.join(DOMAIN, random_string(5) + '.conf')
-        with open(config_file, 'w') as f:
-            # f.write('[extensions]\n')
-            vals = fields['extension']
-            if isinstance(vals, list):
-                for val in vals:
-                    if not isinstance(val, str):
-                        raise ValueError('Extension in list of extensions must be a string')
-                    f.write("%s\n" % val)
-            elif isinstance(vals, str):
-                f.write("%s\n" % vals)
-            else:
-                raise ValueError('Extension must be a string or list of strings')
+    filename = sys.argv[1]
+    with open(filename, 'r') as f:
+        doc = yaml.load(f)
+
+    # Process required common fields
+    if 'common' not in doc:
+        raise Exception('common fields not in doc')
+    common = doc['common']
+    common_options = common.pop('options', {})
+
+    # Process common options
+    if 'localdomain' in common_options and common_options['localdomain'] is True:
+        common['domain'] = this_domain
+
+    DOMAIN = common['domain']
+
+    # Default options
+    KEYSIZE = common_options.get('keysize', 2048)  # in bytes
+    LIFETIME = common_options.get('lifetime', 365)  # in days
+    common['lifetime'] = LIFETIME
+
+    # Process hosts
+    if 'hosts' not in doc:
+        raise ValueError('hosts list not in doc')
+    hosts = doc['hosts']
+
+    # Make directory to hold results
+    logging.info('All generated PKI files will be in directory: {}'.format(DOMAIN))
+    if os.path.exists(DOMAIN):
+        logging.warning('Directory {} already exists. This script will overwrite its contents if any filename matches.'.format(DOMAIN))
     else:
-        config_file = None
+        os.makedirs(DOMAIN)
 
-    return config_file
+    # Make CA key
+    logging.info('Making CA private key...')
+    ca_key = gen_key(KEYSIZE)
+    write_private_key(ca_key, os.path.join(DOMAIN, 'ca.key'))
+
+    # Make CA cert
+    logging.info('Making CA certificate...')
+    ca_crt = gen_ca(ca_key, **merge_dict(common, {'CN': 'ca'}))
+    write_certificate(ca_crt, os.path.join(DOMAIN, 'ca.pem'))
+
+    # Expand hosts with template strings and add to hosts
+    for i in range(len(hosts)):
+        host = hosts[i]
+        if isinstance(host, str) and "[" in host:  # expanded hosts can't override anything
+            hosts.extend(pkitools.expand(host))  # online extension is OK since we only iterate thru original entries
+            hosts[i] = None
+
+    # Make host certificates
+    logging.info('Making host certificates...')
+    for host in hosts:
+        if host is None:  # skip holes from template interpolation
+            continue
+
+        elif isinstance(host, str):  # Use all default fields + hostname
+            fields = merge_dict(common, {'hostname': host})
+
+        elif isinstance(host, dict):  # Overwrite some fields
+            for k in host:  # Assign name of struct into a field where it can be processed; there should just be the one iteration
+                hostname = k
+            extra_fields = host[hostname]
+            extra_fields['hostname'] = hostname
+
+            options = extra_fields.pop('options', {})
+            if 'localhost' in options and options['localhost'] is True:
+                extra_fields['hostname'] = this_host
+            if 'localdomain' in options and options['localdomain'] is True:
+                extra_fields['domain'] = this_domain
+            if 'extension' in options:  # Arbitrary extra extensions
+                extra_fields['extension'] = options['extension']
+
+            fields = merge_dict(common, extra_fields)
+
+        else:
+            raise ValueError('host is not a str or dict')
+
+        hostname = fields['hostname']
+
+        logging.info("Making {}'s private key...".format(hostname))
+        key = gen_key(KEYSIZE)
+        write_private_key(key, os.path.join(DOMAIN, '{}.key'.format(hostname)))
+
+        logging.info("Making and signing {}'s certificate...".format(hostname))
+        crt = sign_key(key, ca_key, ca_crt, **fields)
+        write_certificate(crt, os.path.join(DOMAIN, '{}.pem'.format(hostname)))
+
+        # Combine key, cert, and CA cert into a pkcs12 WITHOUT a password file if desired
+        #   Keeps the individual files around
+        if 'combine_pkcs12' in common_options:
+            p12 = crypto.PKCS12()
+            p12.set_ca_certificates([ca_crt])
+            p12.set_certificate(crt)
+            p12.set_privatekey(key)
+            with open(filename, 'wb') as f:
+                f.write(p12.export())
+
+    logging.info('done.')
 
 
-def runcmd(cmd):
-    """Helper function for debugging and running shell commands"""
-    print('> ' + cmd)
-    call(cmd, shell=True)
-
-
-# Process required common fields
-if 'common' not in doc:
-    raise Exception('common fields not in doc')
-common = doc['common']
-common_options = common.pop('options', {})
-
-# Process common options
-if 'localdomain' in common_options and common_options['localdomain'] is True:
-    common['domain'] = this_domain
-
-DOMAIN = common['domain']
-
-# Default options
-if 'keysize' in common_options:
-    KEYSIZE = common_options['keysize']
-else:
-    KEYSIZE = 2048
-
-if 'lifetime' in common_options:
-    LIFETIME = common_options['lifetime']
-else:
-    LIFETIME = 365
-
-# Process hosts
-if 'hosts' not in doc:
-    raise ValueError('hosts list not in doc')
-hosts = doc['hosts']
-
-# Make directory to hold results
-print('All generated PKI files will be in directory: %s' % (DOMAIN,))
-if os.path.exists(DOMAIN):
-    print("Directory %s already exists. This script will overwrite its contents if any filename matches." % DOMAIN)
-else:
-    os.makedirs(DOMAIN)
-
-# Make CA
-print('Making CA private key...')
-runcmd("openssl genrsa -out %s %d" % (os.path.join(DOMAIN, 'ca.key'), KEYSIZE))
-
-# Make CA cert
-print('Making CA certificate...')
-ca_subject_fields = merge_dict(common, {'hostname': 'ca'})
-ca_subject = make_subject(ca_subject_fields)
-runcmd('openssl req -x509 -new -nodes -key %s -days %d -out %s -sha256 -subj "%s"' % (
-        os.path.join(DOMAIN, 'ca.key'),
-        LIFETIME,
-        os.path.join(DOMAIN, 'ca.pem'),
-        ca_subject))
-
-# Delete existing serial to start clean
-print('Deleting old serial (if it exists)...')
-serial_file = os.path.join(DOMAIN, 'ca.srl')
-if os.path.isfile(serial_file):
-    os.remove(serial_file)
-
-# Expand hosts with template strings and add to hosts
-expandedHosts = []
-for i in range(len(hosts)):
-    host = hosts[i]
-    if isinstance(host, str) and "[" in host:  # expanded hosts can't override anything
-        hosts.extend(pkitools.expand(host))  # online extension is OK since we only iterate thru original entries
-        hosts[i] = None
-
-# Make host certificates
-print('Making host certificates...')
-ind = 1  # Index for serial number generation
-for host in hosts:
-
-    if host is None:  # skip holes from template interpolation
-        continue
-
-    elif isinstance(host, str):  # Use all default fields + hostname
-        fields = merge_dict(common, {'hostname': host})
-
-    elif isinstance(host, dict):  # Overwrite some fields
-        for k in host:  # Assign name of struct into a field where it can be processed; there should just be the one iteration
-            hostname = k
-        extra_fields = host[hostname]
-        extra_fields['hostname'] = hostname
-
-        options = extra_fields.pop('options', {})
-        if 'localhost' in options and options['localhost'] is True:
-            extra_fields['hostname'] = this_host
-        if 'localdomain' in options and options['localdomain'] is True:
-            extra_fields['domain'] = this_domain
-        if 'extension' in options:  # Arbitrary extra extensions
-            extra_fields['extension'] = options['extension']
-
-        fields = merge_dict(common, extra_fields)
-
-    else:
-        raise ValueError('host is not a str or dict')
-
-    hostname = fields['hostname']
-    subject = make_subject(fields)
-    extension_config_file = make_extensions(fields)
-
-    print("Making %s's private key..." % (hostname,))
-    runcmd("openssl genrsa -out %s %d" % (os.path.join(DOMAIN, '%s.key' % (hostname,)), KEYSIZE))
-
-    print("Making %s's CSR..." % (hostname,))
-    runcmd('openssl req -new -key %s -out %s -sha256 -subj "%s"' % (
-        os.path.join(DOMAIN, '%s.key' % (hostname,)),
-        os.path.join(DOMAIN, '%s.csr' % (hostname,)),
-        subject))
-
-    # The 1st CSR signed is used to generate a random serial
-    print("Signing %s's certificate..." % (hostname,))
-    if ind == 1:
-        serial_string = '-CAcreateserial'
-    else:
-        serial_string = ''
-
-    if extension_config_file is not None:
-        extension_string = '-extfile %s' % extension_config_file
-    else:
-        extension_string = ''
-
-    runcmd('openssl x509 -req -in %s -CA %s -CAkey %s %s -CAserial %s %s -out %s -days %d' % (
-        os.path.join(DOMAIN, '%s.csr' % (hostname,)),
-        os.path.join(DOMAIN, 'ca.pem'),
-        os.path.join(DOMAIN, 'ca.key'),
-        serial_string,
-        serial_file,
-        extension_string,
-        os.path.join(DOMAIN, '%s.pem' % (hostname,)),
-        LIFETIME))
-
-    if extension_config_file is not None:  # Cleanup. If the above command fails, you can look at the config file.
-        os.remove(extension_config_file)
-
-    # Combine certs into pkcs12 format if desired
-    # Also remove separate cert and key
-    # TODO: add other options here as desired - for example, don't include the CA cert in there
-    if 'combine_pkcs12' in common_options:
-        COMBINE_MODE = common_options['combine_pkcs12']
-        if COMBINE_MODE == 'all':
-            runcmd('openssl pkcs12 -export -in %s -inkey %s -certfile %s -out %s -passout pass:' % (
-                os.path.join(DOMAIN, '%s.pem' % (hostname,)),
-                os.path.join(DOMAIN, '%s.key' % (hostname,)),
-                os.path.join(DOMAIN, 'ca.pem'),
-                os.path.join(DOMAIN, '%s.p12' % (hostname,)),
-            ))
-            os.remove(os.path.join(DOMAIN, '%s.pem' % (hostname,)))
-            os.remove(os.path.join(DOMAIN, '%s.key' % (hostname,)))
-
-    f_srl = open(serial_file)
-    srl = f_srl.read()
-    f_srl.close()
-    print("%s's certificate has serial number %s..." % (hostname, srl))
-
-    # Increment index for serial number generation
-    ind += 1
-
-print('done.')
+if __name__ == '__main__':
+    main()
