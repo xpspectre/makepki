@@ -71,6 +71,7 @@ def gen_ca(ca_key, **fields):
     crt = crypto.X509()
     crt.set_version(2)  # version 3, counts from 0
     crt.set_serial_number(1)
+    crt.set_pubkey(ca_key)
 
     sub = crt.get_subject()
     for sub_field in _SUBJECT_FIELDS:
@@ -88,7 +89,6 @@ def gen_ca(ca_key, **fields):
     crt.gmtime_adj_notBefore(0)
     crt.gmtime_adj_notAfter(fields['lifetime'] * _ONE_DAY_IN_SEC)
 
-    crt.set_pubkey(ca_key)
     crt.sign(ca_key, 'sha256')
     return crt
 
@@ -121,6 +121,7 @@ def sign_key(key, ca_key, ca_crt, **fields):
     crt = crypto.X509()
     crt.set_version(2)
     crt.set_serial_number(int(uuid.uuid4()))  # all certs now get a random serial number
+    crt.set_pubkey(key)
 
     crt.set_subject(req.get_subject())
     crt.set_issuer(ca_crt.get_subject())
@@ -153,7 +154,6 @@ def sign_key(key, ca_key, ca_crt, **fields):
     crt.gmtime_adj_notBefore(0)
     crt.gmtime_adj_notAfter(fields['lifetime'] * _ONE_DAY_IN_SEC)
 
-    crt.set_pubkey(key)
     crt.sign(ca_key, 'sha256')
 
     return crt
