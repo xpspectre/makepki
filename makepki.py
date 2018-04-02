@@ -59,12 +59,11 @@ def write_certificate(crt, filename):
 
 
 def gen_ca(ca_key, **fields):
-    """Create CA authority/cert.
+    """Create CA authority/cert. No intermediate CAs can be made under this.
 
     Args:
         ca_key: PKey obj, CA private key
-        fields: named args dict of fields
-
+        fields: named args dict of fields. TODO: Spec for what should be in here.
 
     Returns:
         X509 obj, CA certificate
@@ -79,6 +78,7 @@ def gen_ca(ca_key, **fields):
             setattr(sub, sub_field, fields[sub_field])
     crt.set_issuer(sub)
 
+    # CA extensions
     crt.add_extensions([
         crypto.X509Extension(b'basicConstraints', True, b'CA:TRUE, pathlen:0'),
         crypto.X509Extension(b'keyUsage', True, b'keyCertSign, cRLSign'),
@@ -100,6 +100,7 @@ def sign_key(key, ca_key, ca_crt, **fields):
         key: PKey obj, client private key
         ca_key: PKey obj, CA private key
         ca_crt: X509 obj, CA certificate
+        fields: see gen_ca()'s fields arg
 
     Returns:
         X509 obj, signed client certificate
@@ -124,14 +125,30 @@ def sign_key(key, ca_key, ca_crt, **fields):
     crt.set_subject(req.get_subject())
     crt.set_issuer(ca_crt.get_subject())
 
-    # Default extensions for all non-CA certs
-    extensions = [
-        crypto.X509Extension(b'basicConstraints', True, b'CA:FALSE'),
-        crypto.X509Extension(b'keyUsage', True, b'nonRepudiation, digitalSignature, keyEncipherment'),
-        crypto.X509Extension(b'subjectKeyIdentifier', False, b'hash', subject=crt),
-        crypto.X509Extension(b'authorityKeyIdentifier', False, b'keyid', issuer=ca_crt),
-    ]
-    crt.add_extensions(extensions)
+    # Add custom extensions
+    exts = set()
+    if 'extension' in fields:
+        for ext in fields['extension']:
+            parts = ext.split('=')
+            k = parts[0]
+            v = parts[1]
+            crt.add_extensions([crypto.X509Extension(k.encode('utf-8'), False, v.encode('utf-8'))])  # set required = False
+            exts.add(k)
+
+    # Set default extensions for all non-CA certs, if they don't conflict w/ above
+    if 'basicConstraints' not in exts:
+        crt.add_extensions([crypto.X509Extension(b'basicConstraints', True, b'CA:FALSE')])
+    if 'keyUsage' not in exts:
+        crt.add_extensions([crypto.X509Extension(b'keyUsage', True, b'nonRepudiation, digitalSignature, keyEncipherment')])
+    if 'subjectKeyIdentifier' not in exts:
+        crt.add_extensions([crypto.X509Extension(b'subjectKeyIdentifier', False, b'hash', subject=crt)])
+    if 'authorityKeyIdentifier' not in exts:
+        crt.add_extensions([crypto.X509Extension(b'authorityKeyIdentifier', False, b'keyid', issuer=ca_crt)])
+
+    # Set subject alternative name to FQDN
+    # TODO: Right now, this overrides any custom list above?
+    san = 'DNS:{}'.format(fields['CN'])
+    crt.add_extensions([crypto.X509Extension(b'subjectAltName', False, san.encode('utf-8'))])
 
     crt.gmtime_adj_notBefore(0)
     crt.gmtime_adj_notAfter(fields['lifetime'] * _ONE_DAY_IN_SEC)
@@ -152,7 +169,7 @@ def merge_dict(bot, top):
 
 
 def random_string(N):
-    """Make random string of letters and digits for temporary extension config file names"""
+    """Make random string of letters and digits"""
     return ''.join(random.SystemRandom().choice(string.ascii_letters + string.digits) for _ in range(N))
 
 
@@ -251,6 +268,7 @@ def main():
             raise ValueError('host is not a str or dict')
 
         hostname = fields['hostname']
+        fields['CN'] = '{}.{}'.format(hostname, DOMAIN)  # SAN extension is also set. It's supposed to ignore this...
 
         logging.info("Making {}'s private key...".format(hostname))
         key = gen_key(KEYSIZE)
@@ -267,8 +285,11 @@ def main():
             p12.set_ca_certificates([ca_crt])
             p12.set_certificate(crt)
             p12.set_privatekey(key)
-            with open(filename, 'wb') as f:
-                f.write(p12.export())
+            password = random_string(16)  # generate random password because it's required for import
+            p12filename = os.path.join(DOMAIN, '{}.p12'.format(hostname))
+            logging.warning('Password {} generated for {}'.format(password, p12filename))
+            with open(p12filename, 'wb') as f:
+                f.write(p12.export(passphrase=password))
 
     logging.info('done.')
 
