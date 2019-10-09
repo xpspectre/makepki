@@ -1,8 +1,7 @@
-asn1crypto==0.24.0
-certifi==2018.11.29
-cffi==1.12.1
-cryptography==2.5
+asn1crypto==1.0.1
+cffi==1.12.3
+cryptography==2.7
 pycparser==2.19
 pyOpenSSL==19.0.0
-PyYAML==3.13
+PyYAML==5.1.2
 six==1.12.0

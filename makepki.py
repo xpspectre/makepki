@@ -16,6 +16,7 @@ import pkitools
 
 _ONE_DAY_IN_SEC = 60 * 60 * 24
 _SUBJECT_FIELDS = ['C', 'ST', 'L', 'O', 'OU', 'CN', 'emailAddress']
+SIGN_HASH = 'sha256'
 
 
 def gen_key(size=2048):
@@ -89,7 +90,7 @@ def gen_ca(ca_key, **fields):
     crt.gmtime_adj_notBefore(0)
     crt.gmtime_adj_notAfter(fields['lifetime'] * _ONE_DAY_IN_SEC)
 
-    crt.sign(ca_key, 'sha256')
+    crt.sign(ca_key, SIGN_HASH)
     return crt
 
 
@@ -115,7 +116,7 @@ def sign_key(key, ca_key, ca_crt, **fields):
             setattr(sub, sub_field, fields[sub_field])
 
     req.set_pubkey(key)
-    req.sign(key, 'sha256')
+    req.sign(key, SIGN_HASH)
 
     # Sign CSR and make crt
     crt = crypto.X509()
@@ -154,7 +155,7 @@ def sign_key(key, ca_key, ca_crt, **fields):
     crt.gmtime_adj_notBefore(0)
     crt.gmtime_adj_notAfter(fields['lifetime'] * _ONE_DAY_IN_SEC)
 
-    crt.sign(ca_key, 'sha256')
+    crt.sign(ca_key, SIGN_HASH)
 
     return crt
 
@@ -191,7 +192,7 @@ def main():
 
     filename = sys.argv[1]
     with open(filename, 'r') as f:
-        doc = yaml.load(f)
+        doc = yaml.safe_load(f)
 
     # Process required common fields
     if 'common' not in doc:
@@ -215,22 +216,29 @@ def main():
         raise ValueError('hosts list not in doc')
     hosts = doc['hosts']
 
+    # Make sure output directory is present
+    this_dir = os.path.dirname(os.path.realpath(__file__))
+    output_base = os.path.join(this_dir, 'output')
+    if not os.path.exists(output_base):
+        os.makedirs(output_base)
+
     # Make directory to hold results
-    logging.info('All generated PKI files will be in directory: {}'.format(DOMAIN))
-    if os.path.exists(DOMAIN):
-        logging.warning('Directory {} already exists. This script will overwrite its contents if any filename matches.'.format(DOMAIN))
+    output_dir = os.path.join(output_base, DOMAIN)
+    logging.info('All generated PKI files will be in directory: {}'.format(output_dir))
+    if os.path.exists(output_dir):
+        logging.warning('Directory {} already exists. This script will overwrite its contents if any filename matches.'.format(output_dir))
     else:
-        os.makedirs(DOMAIN)
+        os.makedirs(output_dir)
 
     # Make CA key
     logging.info('Making CA private key...')
     ca_key = gen_key(KEYSIZE)
-    write_private_key(ca_key, os.path.join(DOMAIN, 'ca.key'))
+    write_private_key(ca_key, os.path.join(output_dir, 'ca.key'))
 
     # Make CA cert
     logging.info('Making CA certificate...')
     ca_crt = gen_ca(ca_key, **merge_dict(common, {'CN': 'ca'}))
-    write_certificate(ca_crt, os.path.join(DOMAIN, 'ca.pem'))
+    write_certificate(ca_crt, os.path.join(output_dir, 'ca.pem'))
 
     # Expand hosts with template strings and add to hosts
     for i in range(len(hosts)):
@@ -272,11 +280,11 @@ def main():
 
         logging.info("Making {}'s private key...".format(hostname))
         key = gen_key(KEYSIZE)
-        write_private_key(key, os.path.join(DOMAIN, '{}.key'.format(hostname)))
+        write_private_key(key, os.path.join(output_dir, '{}.key'.format(hostname)))
 
         logging.info("Making and signing {}'s certificate...".format(hostname))
         crt = sign_key(key, ca_key, ca_crt, **fields)
-        write_certificate(crt, os.path.join(DOMAIN, '{}.pem'.format(hostname)))
+        write_certificate(crt, os.path.join(output_dir, '{}.pem'.format(hostname)))
 
         # Combine key, cert, and CA cert into a pkcs12 WITHOUT a password file if desired
         #   Keeps the individual files around

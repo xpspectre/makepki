@@ -1,3 +1,6 @@
+# Exclude output dir for generated stuff
+output/
+
 .idea/
 
 # Created by https://www.gitignore.io/api/python,pycharm
