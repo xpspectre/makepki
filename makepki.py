@@ -36,6 +36,20 @@ def gen_key(size=2048):
     return key
 
 
+def read_private_key(filename, passphrase=None):
+    """Read private key with PEM encoding
+
+    Args:
+        filename: str location of key file
+        passphrase: str passphrase to decrypt key
+
+    Returns:
+        PKey obj, private key
+    """
+    with open(filename, 'rb') as f:
+        return crypto.load_privatekey(crypto.FILETYPE_PEM, f.read(), passphrase=passphrase)
+
+
 def write_private_key(key, filename, passphrase=None):
     """Write key to file using usual PEM encoding, optionally encrypted with passphrase
 
@@ -57,6 +71,19 @@ def write_certificate(crt, filename):
     """
     with open(filename, 'wb') as f:
         f.write(crypto.dump_certificate(crypto.FILETYPE_PEM, crt))
+
+
+def read_certificate(filename):
+    """Read certificate from file using PEM encoding
+
+    Args:
+        filename: str path to certificace
+
+    Returns:
+        X509 obj, certificate
+    """
+    with open(filename, 'rb') as f:
+        return crypto.load_certificate(crypto.FILETYPE_PEM, f.read())
 
 
 def gen_ca(ca_key, **fields):
@@ -230,15 +257,27 @@ def main():
     else:
         os.makedirs(output_dir)
 
-    # Make CA key
-    logging.info('Making CA private key...')
-    ca_key = gen_key(KEYSIZE)
-    write_private_key(ca_key, os.path.join(output_dir, 'ca.key'))
+    # Determine whether we're generating a new CA or loading an existing one
+    cakey_file = os.path.join(output_dir, 'ca.key')
+    cacrt_file = os.path.join(output_dir, 'ca.pem')
+    if 'cacrt' in doc and 'cakey' in doc:  # load exising ca
+        # TODO: Right now, this assumes the CA key and crt are the same form as output by this function;
+        #   we can actually use the value in those fields (relative to this config) as well
+        logging.info('Loading CA private key...')
+        ca_key = read_private_key(cakey_file)
 
-    # Make CA cert
-    logging.info('Making CA certificate...')
-    ca_crt = gen_ca(ca_key, **merge_dict(common, {'CN': 'ca'}))
-    write_certificate(ca_crt, os.path.join(output_dir, 'ca.pem'))
+        logging.info('Loading CA certificate...')
+        ca_crt = read_certificate(cacrt_file)
+    else:
+        # Make CA key
+        logging.info('Making CA private key...')
+        ca_key = gen_key(KEYSIZE)
+        write_private_key(ca_key, cakey_file)
+
+        # Make CA cert
+        logging.info('Making CA certificate...')
+        ca_crt = gen_ca(ca_key, **merge_dict(common, {'CN': 'ca'}))
+        write_certificate(ca_crt, cacrt_file)
 
     # Expand hosts with template strings and add to hosts
     for i in range(len(hosts)):
