@@ -236,6 +236,7 @@ def main():
     # Default options
     KEYSIZE = common_options.get('keysize', 2048)  # in bytes
     LIFETIME = common_options.get('lifetime', 365)  # in days
+    CACN = common_options.get('cacn', 'ca')
     common['lifetime'] = LIFETIME
 
     # Process hosts
@@ -276,7 +277,7 @@ def main():
 
         # Make CA cert
         logging.info('Making CA certificate...')
-        ca_crt = gen_ca(ca_key, **merge_dict(common, {'CN': 'ca'}))
+        ca_crt = gen_ca(ca_key, **merge_dict(common, {'CN': CACN}))
         write_certificate(ca_crt, cacrt_file)
 
     # Expand hosts with template strings and add to hosts
