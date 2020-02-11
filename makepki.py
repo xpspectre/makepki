@@ -174,10 +174,16 @@ def sign_key(key, ca_key, ca_crt, **fields):
     if 'authorityKeyIdentifier' not in exts:
         crt.add_extensions([crypto.X509Extension(b'authorityKeyIdentifier', False, b'keyid', issuer=ca_crt)])
 
-    # Set subject alternative name to FQDN
-    # TODO: Right now, this overrides any custom list above?
-    san = 'DNS:{}'.format(fields['CN'])
-    crt.add_extensions([crypto.X509Extension(b'subjectAltName', False, san.encode('utf-8'))])
+    # Set subject alternative name - required for modern SSL certificates
+    #   If CN is a FQDN, use DNS entry; if CN is an IP address, use IP entry
+    #   If subjectAltName is already set above, skip this
+    if 'subjectAltName' not in exts:
+        cn = fields['CN']
+        if is_valid_ipv4_address(cn):
+            san = 'IP:{}'.format(cn)
+        else:
+            san = 'DNS:{}'.format(cn)
+        crt.add_extensions([crypto.X509Extension(b'subjectAltName', False, san.encode('utf-8'))])
 
     crt.gmtime_adj_notBefore(0)
     crt.gmtime_adj_notAfter(fields['lifetime'] * _ONE_DAY_IN_SEC)
@@ -199,6 +205,20 @@ def merge_dict(bot, top):
 def random_string(N):
     """Make random string of letters and digits"""
     return ''.join(random.SystemRandom().choice(string.ascii_letters + string.digits) for _ in range(N))
+
+
+def is_valid_ipv4_address(address):
+    """Check if address str is a valid IPv4 address (with all parts)"""
+    try:
+        socket.inet_pton(socket.AF_INET, address)
+    except AttributeError:  # no inet_pton here, sorry
+        try:
+            socket.inet_aton(address)
+        except socket.error:
+            return False
+        return address.count('.') == 3
+    except socket.error:  # not a valid address
+        return False
 
 
 def main():
@@ -290,6 +310,8 @@ def main():
     # Make host certificates
     logging.info('Making host certificates...')
     for host in hosts:
+        nodomain = False  # whether to suppress appending domain to hostname to form CN and SAN
+
         if host is None:  # skip holes from template interpolation
             continue
 
@@ -310,13 +332,19 @@ def main():
             if 'extension' in options:  # Arbitrary extra extensions
                 extra_fields['extension'] = options['extension']
 
+            if 'nodomain' in options and options['nodomain'] is True:
+                nodomain = True
+
             fields = merge_dict(common, extra_fields)
 
         else:
             raise ValueError('host is not a str or dict')
 
         hostname = fields['hostname']
-        fields['CN'] = '{}.{}'.format(hostname, DOMAIN)  # SAN extension is also set. It's supposed to ignore this...
+        if nodomain:
+            fields['CN'] = hostname
+        else:
+            fields['CN'] = '{}.{}'.format(hostname, fields['domain'])
 
         logging.info("Making {}'s private key...".format(hostname))
         key = gen_key(KEYSIZE)
