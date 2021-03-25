@@ -3,5 +3,5 @@ cffi==1.14.0
 cryptography==2.9.2
 pycparser==2.20
 pyOpenSSL==19.0.0
-PyYAML==5.1.2
+PyYAML==5.4
 six==1.15.0
