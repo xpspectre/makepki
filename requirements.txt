@@ -1,7 +1,5 @@
-asn1crypto==1.0.1
-cffi==1.14.0
-cryptography==2.9.2
-pycparser==2.20
-pyOpenSSL==19.0.0
-PyYAML==5.1.2
-six==1.15.0
+cffi==1.15.1
+cryptography==39.0.0
+pycparser==2.21
+pyOpenSSL==23.0.0
+PyYAML==6.0
