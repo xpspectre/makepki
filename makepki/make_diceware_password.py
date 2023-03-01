@@ -1,6 +1,11 @@
-import argparse
+import os
 import re
-from random import SystemRandom
+import secrets
+import argparse
+
+this_dir = os.path.dirname(os.path.realpath(__file__))
+
+default_wordlist = os.path.abspath(os.path.join(this_dir, 'diceware.wordlist.asc'))
 
 
 def read_wordlist(wordlist_file):
@@ -20,20 +25,10 @@ def read_wordlist(wordlist_file):
 
 def roll_dice(n):
     """Roll n 6-sided dice"""
-    sys_random = SystemRandom()
-    return [sys_random.randrange(1, 7) for i in range(n)]
+    return [secrets.choice([1, 2, 3, 4, 5, 6]) for _ in range(n)]
 
 
-if __name__ == "__main__":
-    # Parse args
-    parser = argparse.ArgumentParser(description='Generate diceware password')
-    parser.add_argument('n', type=int, help='Number of words in password')
-    parser.add_argument('-w', '--wordlist', help='Wordlist file', default='diceware.wordlist.asc')
-    args = parser.parse_args()
-
-    n = args.n
-    wordlist_file = args.wordlist
-
+def gen_password(n, wordlist_file):
     # Read wordlist
     words = read_wordlist(wordlist_file)
 
@@ -45,4 +40,15 @@ if __name__ == "__main__":
         dice_str = ''.join(str(x) for x in dice)
         password.append(words[dice_str])
 
-    print(' '.join(password))
+    return ' '.join(password)
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Generate diceware password')
+    parser.add_argument('n', type=int, help='Number of words in password')
+    parser.add_argument('-w', '--wordlist', help='Wordlist file', default=default_wordlist)
+    args = parser.parse_args()
+
+    password = gen_password(args.n, args.wordlist)
+
+    print(password)
