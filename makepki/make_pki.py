@@ -4,13 +4,18 @@ Sample config file at example.conf in the directory
 import os
 import sys
 import copy
-import uuid
 import yaml
 import string
 import socket
 import logging
 import secrets
-from OpenSSL import crypto
+import ipaddress
+from datetime import datetime, timedelta
+from cryptography import x509
+from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives import serialization, hashes
+from cryptography.hazmat.primitives.serialization.pkcs12 import serialize_key_and_certificates
 
 from makepki.pkitools import expand
 
@@ -18,9 +23,41 @@ log = logging.getLogger(__name__)
 
 this_dir = os.path.dirname(os.path.realpath(__file__))
 
-_ONE_DAY_IN_SEC = 60 * 60 * 24
-_SUBJECT_FIELDS = ['C', 'ST', 'L', 'O', 'OU', 'CN', 'emailAddress']
-SIGN_HASH = 'sha256'
+SUBJECT_FIELDS = {
+    'C': NameOID.COUNTRY_NAME,
+    'ST': NameOID.STATE_OR_PROVINCE_NAME,
+    'L': NameOID.LOCALITY_NAME,
+    'O': NameOID.ORGANIZATION_NAME,
+    'OU': NameOID.ORGANIZATIONAL_UNIT_NAME,
+    'CN': NameOID.COMMON_NAME,
+    'emailAddress': NameOID.EMAIL_ADDRESS,
+}
+EXTENSION_FIELDS = {
+    'keyUsage': x509.KeyUsage,
+    'extendedKeyUsage': x509.ExtendedKeyUsage,
+}
+KEY_USAGE = {
+    'digitalSignature': 'digital_signature',
+    'contentCommitment': 'content_commitment',  # aka nonRepudiation
+    'keyEncipherment': 'key_encipherment',
+    'dataEncipherment': 'data_encipherment',
+    'keyCertSign': 'key_cert_sign',
+    'cRLSign': 'crl_sign',
+    'keyAgreement': 'key_agreement',
+    'encipherOnly': 'encipher_only',
+    'decipherOnly': 'decipher_only',
+}
+DEFAULT_KEY_USAGE_KWARGS = {val: False for val in KEY_USAGE.values()}
+EXTENDED_KEY_USAGE = {
+    'serverAuth': ExtendedKeyUsageOID.SERVER_AUTH,
+    'clientAuth': ExtendedKeyUsageOID.CLIENT_AUTH,
+    'codeSigning': ExtendedKeyUsageOID.CODE_SIGNING,
+    'emailProtection': ExtendedKeyUsageOID.EMAIL_PROTECTION,
+    'timeStamping': ExtendedKeyUsageOID.TIME_STAMPING,
+    'OCSPSigning': ExtendedKeyUsageOID.OCSP_SIGNING,
+    'ipsecIKE': ExtendedKeyUsageOID.IPSEC_IKE,
+    'anyExtendedUsage': ExtendedKeyUsageOID.ANY_EXTENDED_KEY_USAGE,
+}
 
 
 def gen_key(size=2048):
@@ -28,16 +65,11 @@ def gen_key(size=2048):
 
     Args:
         size: int, size of key in bytes. Min size = 2048.
-
-    Returns:
-        PKey obj, private key
     """
     if size < 2048:
         raise ValueError('Key must be >= 2048 bytes')
 
-    key = crypto.PKey()
-    key.generate_key(crypto.TYPE_RSA, size)
-    return key
+    return rsa.generate_private_key(public_exponent=65537, key_size=size)
 
 
 def read_private_key(filename, passphrase=None):
@@ -46,12 +78,9 @@ def read_private_key(filename, passphrase=None):
     Args:
         filename: str location of key file
         passphrase: str passphrase to decrypt key
-
-    Returns:
-        PKey obj, private key
     """
     with open(filename, 'rb') as f:
-        return crypto.load_privatekey(crypto.FILETYPE_PEM, f.read(), passphrase=passphrase)
+        return serialization.load_pem_private_key(f.read(), password=passphrase)
 
 
 def write_private_key(key, filename, passphrase=None):
@@ -62,8 +91,17 @@ def write_private_key(key, filename, passphrase=None):
         filename: str location to save file
         passphrase: str passphrase to encrypt key
     """
+    kwargs = {
+        'encoding': serialization.Encoding.PEM,
+        'format': serialization.PrivateFormat.TraditionalOpenSSL
+    }
+    if passphrase is None:
+        kwargs['encryption_algorithm'] = serialization.NoEncryption()
+    else:
+        kwargs['encryption_algorithm'] = serialization.BestAvailableEncryption(passphrase)
+    pem = key.private_bytes(**kwargs)
     with open(filename, 'wb') as f:
-        f.write(crypto.dump_privatekey(crypto.FILETYPE_PEM, key, passphrase=passphrase))
+        f.write(pem)
 
 
 def write_certificate(crt, filename):
@@ -74,7 +112,7 @@ def write_certificate(crt, filename):
         filename: str location to save file
     """
     with open(filename, 'wb') as f:
-        f.write(crypto.dump_certificate(crypto.FILETYPE_PEM, crt))
+        f.write(crt.public_bytes(serialization.Encoding.PEM))
 
 
 def read_certificate(filename):
@@ -87,11 +125,11 @@ def read_certificate(filename):
         X509 obj, certificate
     """
     with open(filename, 'rb') as f:
-        return crypto.load_certificate(crypto.FILETYPE_PEM, f.read())
+        return x509.load_pem_x509_certificate(f.read())
 
 
 def gen_ca(ca_key, **fields):
-    """Create CA authority/cert. No intermediate CAs can be made under this.
+    """Create CA cert from an existing private key. No intermediate CAs can be made under this.
 
     Args:
         ca_key: PKey obj, CA private key
@@ -100,28 +138,34 @@ def gen_ca(ca_key, **fields):
     Returns:
         X509 obj, CA certificate
     """
-    crt = crypto.X509()
-    crt.set_version(2)  # version 3, counts from 0
-    crt.set_serial_number(1)
-    crt.set_pubkey(ca_key)
+    ca_pubkey = ca_key.public_key()
 
-    sub = crt.get_subject()
-    for sub_field in _SUBJECT_FIELDS:
-        if sub_field in fields:
-            setattr(sub, sub_field, fields[sub_field])
-    crt.set_issuer(sub)
+    builder = x509.CertificateBuilder()
 
-    # CA extensions
-    crt.add_extensions([
-        crypto.X509Extension(b'basicConstraints', True, b'CA:TRUE, pathlen:0'),
-        crypto.X509Extension(b'keyUsage', True, b'keyCertSign, cRLSign'),
-        crypto.X509Extension(b'subjectKeyIdentifier', False, b'hash', subject=crt),
-    ])
+    name = []
+    for key, val in SUBJECT_FIELDS.items():
+        if key not in fields:
+            continue
+        name.append(x509.NameAttribute(val, fields[key]))
+    builder = builder.subject_name(x509.Name(name))
+    builder = builder.issuer_name(x509.Name(name))
 
-    crt.gmtime_adj_notBefore(0)
-    crt.gmtime_adj_notAfter(fields['lifetime'] * _ONE_DAY_IN_SEC)
+    now = datetime.now()
+    builder = builder.not_valid_before(now)
+    builder = builder.not_valid_after(now + timedelta(days=fields['lifetime']))
 
-    crt.sign(ca_key, SIGN_HASH)
+    builder = builder.serial_number(x509.random_serial_number())
+    builder = builder.public_key(ca_pubkey)
+
+    builder = builder.add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+    builder = builder.add_extension(x509.KeyUsage(key_cert_sign=True, crl_sign=True,
+                                                  digital_signature=False, content_commitment=False,
+                                                  key_encipherment=False, data_encipherment=False,
+                                                  key_agreement=False, encipher_only=False, decipher_only=False),
+                                    critical=True)
+    builder = builder.add_extension(x509.SubjectKeyIdentifier.from_public_key(ca_pubkey), critical=False)
+
+    crt = builder.sign(private_key=ca_key, algorithm=hashes.SHA256())
     return crt
 
 
@@ -137,48 +181,66 @@ def sign_key(key, ca_key, ca_crt, **fields):
     Returns:
         X509 obj, signed client certificate
     """
+    pubkey = key.public_key()
+    ca_pubkey = ca_key.public_key()
 
-    # Make CSR
-    req = crypto.X509Req()
+    builder = x509.CertificateBuilder()
 
-    sub = req.get_subject()
-    for sub_field in _SUBJECT_FIELDS:
-        if sub_field in fields:
-            setattr(sub, sub_field, fields[sub_field])
+    name = []
+    for key, val in SUBJECT_FIELDS.items():
+        if key not in fields:
+            continue
+        name.append(x509.NameAttribute(val, fields[key]))
+    builder = builder.subject_name(x509.Name(name))
 
-    req.set_pubkey(key)
-    req.sign(key, SIGN_HASH)
+    builder = builder.issuer_name(ca_crt.issuer)
 
-    # Sign CSR and make crt
-    crt = crypto.X509()
-    crt.set_version(2)
-    crt.set_serial_number(int(uuid.uuid4()))  # all certs now get a random serial number
-    crt.set_pubkey(key)
+    now = datetime.now()
+    builder = builder.not_valid_before(now)
+    builder = builder.not_valid_after(now + timedelta(days=fields['lifetime']))
 
-    crt.set_subject(req.get_subject())
-    crt.set_issuer(ca_crt.get_subject())
+    builder = builder.serial_number(x509.random_serial_number())
+    builder = builder.public_key(pubkey)
 
-    # Add custom extensions
     exts = set()
+
+    # Set specified extensions
     if 'extension' in fields:
         for ext in fields['extension']:
             parts = ext.split('=')
-            k = parts[0]
-            v = parts[1]
-            crt.add_extensions(
-                [crypto.X509Extension(k.encode('utf-8'), False, v.encode('utf-8'))])  # set required = False
-            exts.add(k)
+            assert len(parts) == 2
+            name, val = parts
+            extension = EXTENSION_FIELDS[name]
+            if extension == x509.KeyUsage:
+                kwargs = {**DEFAULT_KEY_USAGE_KWARGS}
+                for usage in [usage.strip() for usage in val.split(',')]:
+                    kwargs[KEY_USAGE[usage]] = True
+                builder = builder.add_extension(x509.KeyUsage(**kwargs), critical=True)
+            elif extension == x509.ExtendedKeyUsage:
+                usages = []
+                for usage in [usage.strip() for usage in val.split(',')]:
+                    usages.append(EXTENDED_KEY_USAGE[usage])
+                builder = builder.add_extension(x509.ExtendedKeyUsage(usages), critical=False)
+            else:
+                raise ValueError(f'Extension {extension} not handled')  # looking up in EXTENSION_FIELDS should fail
+            exts.add(name)
 
     # Set default extensions for all non-CA certs, if they don't conflict w/ above
     if 'basicConstraints' not in exts:
-        crt.add_extensions([crypto.X509Extension(b'basicConstraints', True, b'CA:FALSE')])
+        builder = builder.add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+
     if 'keyUsage' not in exts:
-        crt.add_extensions(
-            [crypto.X509Extension(b'keyUsage', True, b'nonRepudiation, digitalSignature, keyEncipherment')])
+        builder = builder.add_extension(x509.KeyUsage(key_cert_sign=False, crl_sign=False,
+                                                      digital_signature=True, content_commitment=False,
+                                                      key_encipherment=True, data_encipherment=False,
+                                                      key_agreement=False, encipher_only=False, decipher_only=False),
+                                        critical=True)
+
     if 'subjectKeyIdentifier' not in exts:
-        crt.add_extensions([crypto.X509Extension(b'subjectKeyIdentifier', False, b'hash', subject=crt)])
+        builder = builder.add_extension(x509.SubjectKeyIdentifier.from_public_key(pubkey), critical=False)
+
     if 'authorityKeyIdentifier' not in exts:
-        crt.add_extensions([crypto.X509Extension(b'authorityKeyIdentifier', False, b'keyid', issuer=ca_crt)])
+        builder = builder.add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_pubkey), critical=False)
 
     # Set subject alternative name - required for modern SSL certificates
     #   If CN is a FQDN, use DNS entry; if CN is an IP address, use IP entry
@@ -186,16 +248,12 @@ def sign_key(key, ca_key, ca_crt, **fields):
     if 'subjectAltName' not in exts:
         cn = fields['CN']
         if is_valid_ipv4_address(cn):
-            san = 'IP:{}'.format(cn)
+            san = x509.IPAddress(ipaddress.IPv4Address(cn))
         else:
-            san = 'DNS:{}'.format(cn)
-        crt.add_extensions([crypto.X509Extension(b'subjectAltName', False, san.encode('utf-8'))])
+            san = x509.DNSName(cn)
+        builder = builder.add_extension(x509.SubjectAlternativeName([san]), critical=False)
 
-    crt.gmtime_adj_notBefore(0)
-    crt.gmtime_adj_notAfter(fields['lifetime'] * _ONE_DAY_IN_SEC)
-
-    crt.sign(ca_key, SIGN_HASH)
-
+    crt = builder.sign(private_key=ca_key, algorithm=hashes.SHA256())
     return crt
 
 
@@ -243,13 +301,13 @@ def build(doc, output_base_dir):
     if 'localdomain' in common_options and common_options['localdomain'] is True:
         common['domain'] = this_domain
 
-    DOMAIN = common['domain']
+    domain: str = common['domain']
 
     # Default options
-    KEYSIZE = common_options.get('keysize', 2048)  # in bytes
-    LIFETIME = common_options.get('lifetime', 365)  # in days
-    CACN = common_options.get('cacn', 'ca')
-    common['lifetime'] = LIFETIME
+    keysize = common_options.get('keysize', 2048)  # in bytes
+    lifetime = common_options.get('lifetime', 365)  # in days
+    cacn = common_options.get('cacn', 'ca')
+    common['lifetime'] = lifetime
 
     # Process hosts
     if 'hosts' not in doc:
@@ -257,7 +315,7 @@ def build(doc, output_base_dir):
     hosts = doc['hosts']
 
     # Make directory to hold results
-    output_dir = os.path.join(output_base_dir, DOMAIN)
+    output_dir = os.path.join(output_base_dir, domain)
     log.info('All generated PKI files will be in directory: {}'.format(output_dir))
     if os.path.exists(output_dir):
         log.warning(
@@ -280,12 +338,12 @@ def build(doc, output_base_dir):
     else:
         # Make CA key
         log.info('Making CA private key...')
-        ca_key = gen_key(KEYSIZE)
+        ca_key = gen_key(keysize)
         write_private_key(ca_key, cakey_file)
 
         # Make CA cert
         log.info('Making CA certificate...')
-        ca_crt = gen_ca(ca_key, **merge_dict(common, {'CN': CACN}))
+        ca_crt = gen_ca(ca_key, **merge_dict(common, {'CN': cacn}))
         write_certificate(ca_crt, cacrt_file)
 
     # Expand hosts with template strings and add to hosts
@@ -335,7 +393,7 @@ def build(doc, output_base_dir):
             fields['CN'] = '{}.{}'.format(hostname, fields['domain'])
 
         log.info("Making {}'s private key...".format(hostname))
-        key = gen_key(KEYSIZE)
+        key = gen_key(keysize)
         write_private_key(key, os.path.join(output_dir, '{}.key'.format(hostname)))
 
         log.info("Making and signing {}'s certificate...".format(hostname))
@@ -345,15 +403,13 @@ def build(doc, output_base_dir):
         # Combine key, cert, and CA cert into a pkcs12 WITHOUT a password file if desired
         #   Keeps the individual files around
         if 'combine_pkcs12' in common_options:
-            p12 = crypto.PKCS12()
-            p12.set_ca_certificates([ca_crt])
-            p12.set_certificate(crt)
-            p12.set_privatekey(key)
             password = random_string(16)  # generate random password because it's required for import
+            content = serialize_key_and_certificates(fields['CN'].encode('utf8'), key, crt, [ca_crt],
+                                                     serialization.BestAvailableEncryption(password.encode('utf8')))
             p12filename = os.path.join(output_dir, '{}.p12'.format(hostname))
             log.warning('Password {} generated for {}'.format(password, p12filename))
             with open(p12filename, 'wb') as f:
-                f.write(p12.export(passphrase=password.encode('utf8')))
+                f.write(content)
 
     log.info('done.')
 
