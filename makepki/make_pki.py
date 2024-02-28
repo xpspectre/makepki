@@ -58,7 +58,6 @@ EXTENDED_KEY_USAGE = {
     'ipsecIKE': ExtendedKeyUsageOID.IPSEC_IKE,
     'anyExtendedUsage': ExtendedKeyUsageOID.ANY_EXTENDED_KEY_USAGE,
 }
-ONE_YEAR = timedelta(days=365)
 
 
 def gen_key(size=2048):
@@ -153,7 +152,7 @@ def gen_ca(ca_key, **fields):
 
     now = datetime.now()
     builder = builder.not_valid_before(now)
-    builder = builder.not_valid_after(now + ONE_YEAR)
+    builder = builder.not_valid_after(now + timedelta(days=fields['lifetime']))
 
     builder = builder.serial_number(x509.random_serial_number())
     builder = builder.public_key(ca_pubkey)
@@ -198,7 +197,7 @@ def sign_key(key, ca_key, ca_crt, **fields):
 
     now = datetime.now()
     builder = builder.not_valid_before(now)
-    builder = builder.not_valid_after(now + ONE_YEAR)
+    builder = builder.not_valid_after(now + timedelta(days=fields['lifetime']))
 
     builder = builder.serial_number(x509.random_serial_number())
     builder = builder.public_key(pubkey)
@@ -302,13 +301,13 @@ def build(doc, output_base_dir):
     if 'localdomain' in common_options and common_options['localdomain'] is True:
         common['domain'] = this_domain
 
-    DOMAIN: str = common['domain']
+    domain: str = common['domain']
 
     # Default options
-    KEYSIZE = common_options.get('keysize', 2048)  # in bytes
-    LIFETIME = common_options.get('lifetime', 365)  # in days
-    CACN = common_options.get('cacn', 'ca')
-    common['lifetime'] = LIFETIME
+    keysize = common_options.get('keysize', 2048)  # in bytes
+    lifetime = common_options.get('lifetime', 365)  # in days
+    cacn = common_options.get('cacn', 'ca')
+    common['lifetime'] = lifetime
 
     # Process hosts
     if 'hosts' not in doc:
@@ -316,7 +315,7 @@ def build(doc, output_base_dir):
     hosts = doc['hosts']
 
     # Make directory to hold results
-    output_dir = os.path.join(output_base_dir, DOMAIN)
+    output_dir = os.path.join(output_base_dir, domain)
     log.info('All generated PKI files will be in directory: {}'.format(output_dir))
     if os.path.exists(output_dir):
         log.warning(
@@ -339,12 +338,12 @@ def build(doc, output_base_dir):
     else:
         # Make CA key
         log.info('Making CA private key...')
-        ca_key = gen_key(KEYSIZE)
+        ca_key = gen_key(keysize)
         write_private_key(ca_key, cakey_file)
 
         # Make CA cert
         log.info('Making CA certificate...')
-        ca_crt = gen_ca(ca_key, **merge_dict(common, {'CN': CACN}))
+        ca_crt = gen_ca(ca_key, **merge_dict(common, {'CN': cacn}))
         write_certificate(ca_crt, cacrt_file)
 
     # Expand hosts with template strings and add to hosts
@@ -394,7 +393,7 @@ def build(doc, output_base_dir):
             fields['CN'] = '{}.{}'.format(hostname, fields['domain'])
 
         log.info("Making {}'s private key...".format(hostname))
-        key = gen_key(KEYSIZE)
+        key = gen_key(keysize)
         write_private_key(key, os.path.join(output_dir, '{}.key'.format(hostname)))
 
         log.info("Making and signing {}'s certificate...".format(hostname))
